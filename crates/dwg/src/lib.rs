@@ -1475,6 +1475,8 @@ mod native {
             assert!(keys.contains(&"ACME_STORE") && !keys.contains(&"ACME_STRAY"), "{version}: {keys:?}");
         }
     }
+
+    #[cfg(test)]
     mod application_object_tests {
         use super::*;
         use acadrust::CadDocument;
