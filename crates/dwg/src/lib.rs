@@ -420,6 +420,7 @@ mod native {
         table_cell_heights(doc);
         table_style_rows(doc, false);
         keep_sort_handles(doc);
+        wipeout_closures(doc, true);
         drop_orphaned_dgn_components(doc)
     }
 
@@ -753,6 +754,34 @@ mod native {
     /// common dimension data), which acadrust keeps no copy of from DXF: it is set here as
     /// CADCraft's DXF writer always sets it (#1094). Bit 0, the opposite of group 70's bit 128,
     /// acadrust 0.6.6 reads and writes itself.
+    /// A polygonal wipeout's clip boundary as each format keeps it: a DXF repeats the first
+    /// vertex at the end (CADCraft's writer does, as other programs' DXF does), a DWG keeps each
+    /// vertex once (AutoCAD's own DWG wipeouts store four corners for a rectangle, the reader
+    /// closes the polygon). `closed`: repeat the first vertex, for the DXF read from a DWG;
+    /// otherwise leave the repeat out, for the DWG written from a DXF. Kept, the repeat went into
+    /// the DWG as a zero-length edge: AutoCAD opened such a drawing as needing recovery, and its
+    /// RECOVER erased all 74 wipeouts of a CADCraft-saved plan (with 38 ellipses, the 112 objects
+    /// it erased). A boundary of fewer than three distinct vertices is left as it is.
+    fn wipeout_closures(doc: &mut acadrust::CadDocument, closed: bool) {
+        for e in doc.entities_mut() {
+            let acadrust::entities::EntityType::Wipeout(w) = e else { continue };
+            if w.clip_type != acadrust::entities::WipeoutClipType::Polygonal {
+                continue;
+            }
+            let v = &mut w.clip_boundary_vertices;
+            let repeated = v.len() > 3 && v.first() == v.last();
+            // A last corner on the first one (an edited boundary, #2256) keeps its repeat: without
+            // it the DWG would read back with that corner taken for the closing repeat.
+            let corner_on_first = v.len() > 3 && v.get(v.len() - 2) == v.first();
+            if !closed && repeated && !corner_on_first {
+                v.pop();
+            } else if closed && !repeated && v.len() >= 3 && v.first() != v.last() {
+                let first = v.first().copied();
+                v.extend(first);
+            }
+        }
+    }
+
     fn dimension_flags(doc: &mut acadrust::CadDocument) {
         for e in doc.entities_mut() {
             let acadrust::entities::EntityType::Dimension(d) = e else { continue };
@@ -1320,14 +1349,20 @@ mod native {
                 Some(source) if doc.version >= acadrust::DxfVersion::AC1027 => super::proxy_transport::restore_classes(&mut doc, source),
                 _ => None,
             };
-            let proxies = match restored {
+            let mut proxies = match restored {
                 Some((objects, entities)) => left_out(objects, entities),
                 None => proxy_classes(&mut doc, classes.as_deref()),
             };
+            // After the classes and the proxies' class numbers are the DWG's.
+            for (kind, n) in left_out(super::proxy_transport::drop_objects_of_entity_classes(&mut doc), 0) {
+                let total = proxies.entry(kind).or_insert(0);
+                *total = total.saturating_add(n);
+            }
             other_layout_owners(&mut doc);
             table_style_rows(&mut doc, true);
             field_formats(&mut doc, &legacy);
             dimension_flags(&mut doc);
+            wipeout_closures(&mut doc, false);
             let mut unwritten = drop_unwritable(&mut doc);
             for (kind, n) in proxies {
                 let total = unwritten.entry(kind).or_insert(0);
@@ -1495,6 +1530,46 @@ mod native {
             let r = guarded(AssertUnwindSafe(|| -> usize { panic!("boom") }));
             assert!(r.is_err());
             assert_eq!(guarded(|| 3), Ok(3));
+        }
+    }
+
+    #[cfg(test)]
+    /// A proxy object that names an entity class is left out of the DWG, with the dictionary entry
+    /// that named it, and reported: AutoCAD doesn't open a drawing with one. CADCraft 0.17.0 wrote
+    /// such drawings (an AutoLISP application's object came back naming a block grip entity
+    /// class). A proxy object of an object class beside it is kept, with its data.
+    #[cfg(not(no_dwg_bridge))]
+    #[test]
+    fn a_proxy_object_of_an_entity_class_is_left_out() {
+        use acadrust::objects::ObjectType;
+        let class = |name: &str, entity: u8| format!("  0\nCLASS\n  1\n{name}\n  2\nAcme{name}\n  3\nAcme\n 90\n0\n 91\n1\n280\n0\n281\n{entity}\n");
+        let proxy = |handle: &str, class: u16| {
+            format!(
+                "  0\nACAD_PROXY_OBJECT\n  5\n{handle}\n330\nC\n100\nAcDbProxyObject\n 90\n499\n 91\n{class}\n 71\n33\n 97\n0\n 70\n0\n161\n18\n310\n5A3CC0\n 94\n0\n"
+            )
+        };
+        let dictionary = "  0\nDICTIONARY\n  5\nC\n330\n0\n100\nAcDbDictionary\n281\n1\n  3\nACME_STORE\n350\n2B\n  3\nACME_STRAY\n350\n2C\n";
+        let dxf = format!(
+            "  0\nSECTION\n  2\nHEADER\n  9\n$ACADVER\n  1\nAC1032\n  0\nENDSEC\n  0\nSECTION\n  2\nCLASSES\n{}{}  0\nENDSEC\n  0\nSECTION\n  2\nOBJECTS\n{dictionary}{}{}  0\nENDSEC\n  0\nEOF\n",
+            class("STORE", 0),
+            class("GRIP", 1),
+            proxy("2B", 500),
+            proxy("2C", 501),
+        );
+        for version in ["AC1027", "AC1032"] {
+            let (dwg, unwritten) = dxf_to_dwg_noted(dxf.as_bytes(), version).unwrap();
+            assert_eq!(unwritten, [("ACAD_PROXY_OBJECT".to_string(), 1)].into_iter().collect::<crate::Unwritten>(), "{version}");
+            let doc = acadrust::DwgReader::from_stream(std::io::Cursor::new(dwg)).read().unwrap();
+            let Some(ObjectType::ProxyObject(kept)) = doc.objects.get(&acadrust::Handle::from(0x2Bu64)) else {
+                panic!("{version}: the object's proxy")
+            };
+            assert_eq!((kept.payload.bit_count, kept.payload.data()), (18, vec![0x5A, 0x3C, 0xC0]), "{version}");
+            let class = doc.classes.iter().find(|c| i32::from(c.class_number) == kept.class_id).unwrap();
+            assert_eq!((class.dxf_name.as_str(), class.is_an_entity), ("STORE", false), "{version}");
+            assert!(!doc.objects.contains_key(&acadrust::Handle::from(0x2Cu64)), "{version}: the entity class's proxy object");
+            let Some(ObjectType::Dictionary(root)) = doc.objects.get(&acadrust::Handle::from(0x0Cu64)) else { panic!("{version}: the dictionary") };
+            let keys: Vec<&str> = root.entries.iter().map(|(k, _)| k.as_str()).collect();
+            assert!(keys.contains(&"ACME_STORE") && !keys.contains(&"ACME_STRAY"), "{version}: {keys:?}");
         }
     }
 
@@ -2319,6 +2394,44 @@ mod tests {
                     assert_eq!(got, want, "mixed {source} kept {kept} as {version}");
                 }
             }
+        }
+    }
+
+    /// A polygonal wipeout's DXF boundary repeats its first vertex; the DWG keeps each vertex
+    /// once, as AutoCAD's own DWG wipeouts do (AutoCAD's RECOVER erased wipeouts that kept the
+    /// repeat). A triangle written with its repeat (4 vertices) keeps 3; a rectangular clip and
+    /// an open polygon are written as they are.
+    #[cfg(not(no_dwg_bridge))]
+    #[test]
+    fn wipeout_boundaries_leave_out_the_repeated_closing_vertex() {
+        let wipeout = |clip: u8, points: &[(f64, f64)]| {
+            let mut s = format!(
+                "  0\nWIPEOUT\n  8\n0\n100\nAcDbEntity\n100\nAcDbWipeout\n 90\n0\n 10\n0\n 20\n0\n 30\n0\n 11\n100\n 21\n0\n 31\n0\n 12\n0\n 22\n40\n 32\n0\n 13\n1\n 23\n1\n 70\n7\n280\n1\n281\n50\n282\n50\n283\n0\n 71\n{clip}\n 91\n{}\n",
+                points.len()
+            );
+            for (x, y) in points {
+                s.push_str(&format!(" 14\n{x}\n 24\n{y}\n"));
+            }
+            s
+        };
+        let closed = [(-0.5, 0.5), (0.5, 0.5), (0.0, -0.5), (-0.5, 0.5)];
+        let square = [(-0.5, 0.5), (0.5, 0.5), (0.5, -0.5), (-0.5, -0.5)];
+        let rect = [(-0.5, -0.5), (0.5, 0.5)];
+        let entities = [wipeout(2, &closed), wipeout(2, &square), wipeout(1, &rect)].concat();
+        let dxf = format!(
+            "  0\nSECTION\n  2\nHEADER\n  9\n$ACADVER\n  1\nAC1032\n  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n{entities}  0\nENDSEC\n  0\nEOF\n"
+        );
+        for version in ["AC1018", "AC1027", "AC1032"] {
+            let dwg = dxf_to_dwg_as(dxf.as_bytes(), version).unwrap();
+            let back = acadrust::DwgReader::from_stream(std::io::Cursor::new(dwg)).read().unwrap();
+            let counts: Vec<usize> = back
+                .entities()
+                .filter_map(|e| match e {
+                    acadrust::entities::EntityType::Wipeout(w) => Some(w.clip_boundary_vertices.len()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(counts, [3, 4, 2], "{version}");
         }
     }
 }
